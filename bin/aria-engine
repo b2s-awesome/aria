@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# aria-engine — runs Spotify Soloist (Spotify's own headless player, ~60 MB) as Aria's audio engine.
+# Soloist is downloaded from Spotify's CDN on first run and again whenever a build expires
+# (builds expire 90 days after their build date; an expired build exits with code 10).
+# It is never redistributed with Aria.
+#
+# Needs a Soloist API key (Spotify for Developers → "Spotify Soloist API Key", Premium account)
+# in ~/.config/aria/soloist.key. First run: pick the "Aria" device once in any Spotify app on
+# this network to log it in; the session is kept in ~/.local/share/aria/soloist.
+set -euo pipefail
+
+URL="https://soloist-builds.spotifycdn.com/soloist_release_x86_64.tar.gz"
+BIN_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aria/soloist-bin"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aria/soloist"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/aria/soloist"
+KEY_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/aria/soloist.key"
+NAME="${ARIA_DEVICE_NAME:-Aria}"
+
+fetch() {
+    echo "aria-engine: downloading Spotify Soloist from Spotify's CDN…" >&2
+    local tmp; tmp=$(mktemp -d)
+    curl -fsSL "$URL" -o "$tmp/soloist.tar.gz"
+    tar -xzf "$tmp/soloist.tar.gz" -C "$tmp"
+    local bin; bin=$(find "$tmp" -type f -name soloist | head -1)
+    [ -n "$bin" ] || { echo "aria-engine: no 'soloist' binary in the archive" >&2; exit 1; }
+    mkdir -p "$BIN_DIR"
+    install -m 755 "$bin" "$BIN_DIR/soloist.new" && mv "$BIN_DIR/soloist.new" "$BIN_DIR/soloist"
+    rm -rf "$tmp"
+    "$BIN_DIR/soloist" --version >&2
+}
+
+[ -s "$KEY_FILE" ] || { echo "aria-engine: put your Soloist API key in $KEY_FILE" >&2; exit 1; }
+[ -x "$BIN_DIR/soloist" ] || fetch
+[ "${1:-}" = "--fetch-only" ] && exit 0
+mkdir -p "$DATA_DIR" "$CACHE_DIR"
+
+while true; do
+    # shortcut: Soloist only takes the key as an argument (visible to local `ps`); fine on a single-user PC.
+    set +e
+    # --ws: local control API for aria-mpris (the OS picks the port; Soloist writes it to $DATA_DIR/ws.port)
+    "$BIN_DIR/soloist" -n "$NAME" -k "$(cat "$KEY_FILE")" -D "$DATA_DIR" -C "$CACHE_DIR" -z 1000 -w 127.0.0.1:0
+    code=$?
+    set -e
+    [ "$code" -eq 10 ] || exit "$code"      # 10 = build expired → fetch a fresh one and restart
+    fetch
+done

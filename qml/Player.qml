@@ -6,7 +6,7 @@ QtObject {
     id: p
 
     required property var api
-    property string deviceName: ""             // empty = this PC's Spotify app (first "Computer" device)
+    property string deviceName: "Aria"         // Soloist (bin/aria-engine); falls back to this PC's Spotify app
     property bool fast: true                   // poll every second while the window is open
 
     property var state: null                   // last /me/player response (null = nothing playing)

@@ -16,8 +16,12 @@ Aria takes its colours from your [Noctalia](https://github.com/noctalia-dev/noct
 
 ## How it plays music
 
-Aria is a remote control. The **official Spotify app** runs hidden in the background and plays the audio, and Aria drives it
-through the Spotify Web API. Librespot-based players such as spotifyd are refused audio keys on many accounts
+Aria is a remote control. Audio comes from **[Spotify Soloist](https://developer.spotify.com/documentation/soloist)**,
+Spotify's official headless player. It's a Spotify Connect device that uses about 60 MB of RAM, versus over 1 GB for the desktop app.
+`bin/aria-engine` downloads Soloist from Spotify's CDN (it is never redistributed here), runs it, and re-downloads it
+when a build expires (builds expire after 90 days). Aria drives it through the Spotify Web API.
+`bin/aria-mpris` bridges Soloist's local WebSocket API to MPRIS, so media keys, `playerctl` and bar widgets work too.
+Librespot-based players such as spotifyd are refused audio keys on many accounts
 ([librespot#1649](https://github.com/librespot-org/librespot/issues/1649)), so Aria doesn't use them.
 Spotify Premium is required.
 
@@ -36,26 +40,32 @@ Keys in the lyrics view:
 
 ## Setup
 
-Requirements: Quickshell 0.3+, Qt 6.8+ (for `FrameAnimation` and `MultiEffect`), Python 3, `spotify-launcher`, and Hyprland.
+Requirements: Quickshell 0.3+, Qt 6.8+ (for `FrameAnimation` and `MultiEffect`), Python 3 with PyGObject and libsoup3, PipeWire, and Hyprland.
 
 1. Create an app at the [Spotify developer dashboard](https://developer.spotify.com/dashboard) with the redirect URI
    `http://127.0.0.1:8898/callback`. Then `cp config.example.json config.json` and fill in your client ID.
-2. Link the config and log in:
+2. Get a Soloist API key (Spotify for Developers → "Spotify Soloist API Key") and save it to `~/.config/aria/soloist.key` (mode 600).
+   Then install and start the engine, and choose the **"Aria"** device once in any Spotify app on your network to log it in:
+   ```sh
+   ln -s "$PWD/bin/aria-engine" "$PWD/bin/aria-mpris" ~/.local/bin/
+   ln -s "$PWD/systemd/aria-engine.service" "$PWD/systemd/aria-mpris.service" ~/.config/systemd/user/
+   systemctl --user daemon-reload && systemctl --user enable --now aria-engine aria-mpris
+   ```
+3. Link the config and log in:
    ```sh
    ln -s "$PWD/qml" ~/.config/quickshell/aria
    ln -s "$PWD/bin/aria-auth" ~/.local/bin/aria-auth
    aria-auth login          # PKCE in your browser; the token is kept in ~/.local/state/aria
    ```
-3. Colours: Aria reads `qml/Colors.qml`, which defines `surface`, `text`, `textDim`, `primary`, `outline` and `accentText`.
+4. Colours: Aria reads `qml/Colors.qml`, which defines `surface`, `text`, `textDim`, `primary`, `outline` and `accentText`.
    With Noctalia, render `noctalia-colors-template.qml` to `~/.config/quickshell/aria/Colors.qml` as a user template.
    Otherwise, write that file by hand.
-4. Hyprland example (Lua config):
+5. Hyprland example (Lua config):
    ```lua
    local ARIA = { class = "^org\\.quickshell$", title = "^Aria$" }
    hl.window_rule({ name = "aria", match = ARIA, workspace = "special:music", float = true, size = "1180 760", center = true })
-   hl.window_rule({ name = "spotify-engine", match = { class = "^[Ss]potify$" }, workspace = "special:spotify silent" })
    hl.bind("SUPER + N", hl.dsp.exec_cmd("qs -c aria ipc call aria toggle"))
-   hl.on("hyprland.start", function() hl.exec_cmd("qs -c aria"); hl.exec_cmd("spotify-launcher") end)
+   hl.on("hyprland.start", function() hl.exec_cmd("qs -c aria") end)
    ```
    IPC commands:
    - `qs -c aria ipc call aria toggle`: show or hide Aria

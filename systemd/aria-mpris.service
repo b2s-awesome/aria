@@ -1,0 +1,12 @@
+[Unit]
+Description=Aria MPRIS bridge (media keys / bar / mini player for Spotify Soloist)
+After=aria-engine.service
+BindsTo=aria-engine.service
+
+[Service]
+ExecStart=%h/.local/bin/aria-mpris
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=aria-engine.service

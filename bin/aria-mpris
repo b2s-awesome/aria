@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""aria-mpris — presents Spotify Soloist (Aria's engine) to the desktop as an MPRIS player.
+
+Soloist has no MPRIS, so media keys (playerctl), bar widgets and the mini player can't see it.
+This bridge reads Soloist's local WebSocket API (enabled by aria-engine with --ws 127.0.0.1:0;
+the port is in <data dir>/ws.port) and serves org.mpris.MediaPlayer2.aria on the session bus.
+Artist/cover come from Soloist's entity decorations when present, else from the Spotify Web API
+(token via aria-auth). Needs PyGObject + libsoup3 only.
+"""
+import json, os, re, subprocess, sys, time
+import gi
+gi.require_version("Soup", "3.0")
+from gi.repository import Gio, GLib, Soup
+
+DATA = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "aria", "soloist")
+BUS_NAME = "org.mpris.MediaPlayer2.aria"
+PATH = "/org/mpris/MediaPlayer2"
+
+XML = """<node>
+ <interface name="org.mpris.MediaPlayer2">
+  <method name="Raise"/><method name="Quit"/>
+  <property name="CanQuit" type="b" access="read"/><property name="CanRaise" type="b" access="read"/>
+  <property name="HasTrackList" type="b" access="read"/><property name="Identity" type="s" access="read"/>
+  <property name="DesktopEntry" type="s" access="read"/>
+  <property name="SupportedUriSchemes" type="as" access="read"/><property name="SupportedMimeTypes" type="as" access="read"/>
+ </interface>
+ <interface name="org.mpris.MediaPlayer2.Player">
+  <method name="Next"/><method name="Previous"/><method name="Pause"/><method name="PlayPause"/>
+  <method name="Stop"/><method name="Play"/>
+  <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+  <method name="SetPosition"><arg direction="in" name="TrackId" type="o"/><arg direction="in" name="Position" type="x"/></method>
+  <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+  <signal name="Seeked"><arg name="Position" type="x"/></signal>
+  <property name="PlaybackStatus" type="s" access="read"/>
+  <property name="LoopStatus" type="s" access="readwrite"/>
+  <property name="Rate" type="d" access="readwrite"/>
+  <property name="Shuffle" type="b" access="readwrite"/>
+  <property name="Metadata" type="a{sv}" access="read"/>
+  <property name="Volume" type="d" access="readwrite"/>
+  <property name="Position" type="x" access="read"/>
+  <property name="MinimumRate" type="d" access="read"/><property name="MaximumRate" type="d" access="read"/>
+  <property name="CanGoNext" type="b" access="read"/><property name="CanGoPrevious" type="b" access="read"/>
+  <property name="CanPlay" type="b" access="read"/><property name="CanPause" type="b" access="read"/>
+  <property name="CanSeek" type="b" access="read"/><property name="CanControl" type="b" access="read"/>
+ </interface>
+</node>"""
+
+LOOP = {"off": "None", "context": "Playlist", "track": "Track"}
+
+
+def name_of(entity):
+    return ((entity or {}).get("decorations") or {}).get("identity", {}).get("name", "")
+
+
+class Bridge:
+    def __init__(self):
+        self.state = {"status": "idle", "item": None, "volume": 0, "options": {"shuffle": False, "repeat": "off"},
+                      "position": {"position_ms": 0, "timestamp_ms": 0, "speed": 0.0}}
+        self.extra = {}            # track uri -> {"artists": [...], "album": str, "art": url} from the Web API
+        self.ws = None
+        self.conn = None
+        self.http = Soup.Session()
+        self.node = Gio.DBusNodeInfo.new_for_xml(XML)
+
+    # ---------- state helpers ----------
+    def track_id(self):
+        uri = (self.state.get("item") or {}).get("uri", "")
+        tid = re.sub(r"[^A-Za-z0-9_]", "_", uri.split(":")[-1]) if uri else ""
+        return PATH + "/aria/track/" + tid if tid else "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+    def position_us(self):
+        p = self.state["position"]
+        ms = p.get("position_ms", 0)
+        if p.get("speed", 0) > 0 and p.get("timestamp_ms"):
+            ms += (time.time() * 1000 - p["timestamp_ms"]) * p["speed"]
+        dur = ((self.state.get("item") or {}).get("decorations") or {}).get("playback", {}).get("duration_ms")
+        if dur:
+            ms = min(ms, dur)
+        return int(max(0, ms) * 1000)
+
+    def metadata(self):
+        item = self.state.get("item") or {}
+        if not item.get("uri"):
+            return {"mpris:trackid": GLib.Variant("o", self.track_id())}
+        dec = item.get("decorations") or {}
+        ex = self.extra.get(item["uri"], {})
+        artists = [name_of(c.get("entity", c)) for c in dec.get("creators", [])] or ex.get("artists", [])
+        covers = (dec.get("visual_identity") or {}).get("cover") or []
+        art = next((c["url"] for c in covers if c.get("size") == "large"), covers[0]["url"] if covers else ex.get("art", ""))
+        album = name_of((dec.get("parent") or {}).get("entity")) or ex.get("album", "")
+        md = {"mpris:trackid": GLib.Variant("o", self.track_id()),
+              "xesam:title": GLib.Variant("s", name_of(item)),
+              "xesam:artist": GLib.Variant("as", [a for a in artists if a]),
+              "xesam:album": GLib.Variant("s", album),
+              "xesam:url": GLib.Variant("s", "https://open.spotify.com/track/" + item["uri"].split(":")[-1])}
+        if art:
+            md["mpris:artUrl"] = GLib.Variant("s", art)
+        dur = (dec.get("playback") or {}).get("duration_ms")
+        if dur:
+            md["mpris:length"] = GLib.Variant("x", int(dur * 1000))
+        return md
+
+    def props(self):
+        st = self.state["status"]
+        live = bool((self.state.get("item") or {}).get("uri"))
+        opts = self.state.get("options") or {}
+        return {
+            "PlaybackStatus": GLib.Variant("s", {"playing": "Playing", "buffering": "Playing", "paused": "Paused"}.get(st, "Stopped")),
+            "LoopStatus": GLib.Variant("s", LOOP.get(opts.get("repeat", "off"), "None")),
+            "Rate": GLib.Variant("d", 1.0), "MinimumRate": GLib.Variant("d", 1.0), "MaximumRate": GLib.Variant("d", 1.0),
+            "Shuffle": GLib.Variant("b", bool(opts.get("shuffle"))),
+            "Metadata": GLib.Variant("a{sv}", self.metadata()),
+            "Volume": GLib.Variant("d", (self.state.get("volume") or 0) / 100.0),
+            "Position": GLib.Variant("x", self.position_us()),
+            "CanGoNext": GLib.Variant("b", live), "CanGoPrevious": GLib.Variant("b", live),
+            "CanPlay": GLib.Variant("b", True), "CanPause": GLib.Variant("b", live),
+            "CanSeek": GLib.Variant("b", live), "CanControl": GLib.Variant("b", True),
+        }
+
+    ROOT = {"CanQuit": ("b", False), "CanRaise": ("b", True), "HasTrackList": ("b", False), "Identity": ("s", "Aria"),
+            "DesktopEntry": ("s", "aria"), "SupportedUriSchemes": ("as", ["spotify"]), "SupportedMimeTypes": ("as", [])}
+
+    def changed(self, names):
+        if not self.conn:
+            return
+        p = self.props()
+        self.conn.emit_signal(None, PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                              GLib.Variant("(sa{sv}as)", ("org.mpris.MediaPlayer2.Player", {n: p[n] for n in names}, [])))
+
+    # ---------- Soloist WebSocket ----------
+    def send(self, command, **fields):
+        if self.ws and self.ws.get_state() == Soup.WebsocketState.OPEN:
+            self.ws.send_text(json.dumps({"type": "command", "command": command, **fields}))
+
+    def connect_ws(self):
+        try:
+            addr = open(os.path.join(DATA, "ws.addr")).read().strip()
+            port = open(os.path.join(DATA, "ws.port")).read().strip()
+        except OSError:
+            GLib.timeout_add_seconds(2, self.connect_ws)      # Soloist not up yet
+            return False
+        msg = Soup.Message.new("GET", f"http://{addr}:{port}/")
+        self.http.websocket_connect_async(msg, None, None, GLib.PRIORITY_DEFAULT, None, self.on_ws, None)
+        return False
+
+    def on_ws(self, session, res, _):
+        try:
+            self.ws = session.websocket_connect_finish(res)
+        except GLib.Error as e:
+            print("aria-mpris: websocket:", e.message, file=sys.stderr)
+            GLib.timeout_add_seconds(2, self.connect_ws)
+            return
+        self.ws.connect("message", self.on_message)
+        self.ws.connect("closed", lambda *_: (setattr(self, "ws", None), GLib.timeout_add_seconds(2, self.connect_ws)))
+        self.send("get_state")
+
+    def on_message(self, ws, kind, data):
+        try:
+            ev = json.loads(data.get_data().decode())
+        except ValueError:
+            return
+        t = ev.get("type")
+        before = self.position_us()
+        if t == "playback_state":
+            self.state.update({k: ev[k] for k in ("status", "item", "volume", "options", "position") if k in ev})
+            self.need_extra()
+            self.changed(["PlaybackStatus", "Metadata", "Volume", "Shuffle", "LoopStatus", "CanGoNext", "CanGoPrevious", "CanPause", "CanSeek"])
+        elif t == "track_changed":
+            self.state["item"] = ev.get("item")
+            self.need_extra()
+            self.changed(["Metadata", "CanGoNext", "CanGoPrevious", "CanPause", "CanSeek"])
+        elif t == "playback_changed":
+            self.state["status"] = ev.get("status", "idle")
+            self.changed(["PlaybackStatus"])
+        elif t == "volume_changed":
+            self.state["volume"] = ev.get("volume", 0)
+            self.changed(["Volume"])
+        elif t == "options_changed":
+            self.state["options"] = ev.get("options") or {}
+            self.changed(["Shuffle", "LoopStatus"])
+        elif t == "position_sync":
+            self.state["position"] = ev.get("position") or self.state["position"]
+            if abs(self.position_us() - before) > 1_500_000 and self.conn:     # a jump, not drift
+                self.conn.emit_signal(None, PATH, "org.mpris.MediaPlayer2.Player", "Seeked",
+                                      GLib.Variant("(x)", (self.position_us(),)))
+        elif t == "auth_state" and ev.get("logged_in"):
+            self.send("get_state")
+
+    # ---------- artist/cover fallback via the Web API ----------
+    def need_extra(self):
+        item = self.state.get("item") or {}
+        uri = item.get("uri", "")
+        dec = item.get("decorations") or {}
+        if not uri.startswith("spotify:track:") or uri in self.extra or (dec.get("creators") and dec.get("visual_identity")):
+            return
+        self.extra[uri] = {}
+        try:
+            token = subprocess.run(["aria-auth", "token"], capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        msg = Soup.Message.new("GET", "https://api.spotify.com/v1/tracks/" + uri.split(":")[-1])
+        msg.get_request_headers().append("Authorization", "Bearer " + token)
+
+        def done(session, res, _):
+            try:
+                d = json.loads(session.send_and_read_finish(res).get_data().decode())
+            except (GLib.Error, ValueError):
+                return
+            imgs = (d.get("album") or {}).get("images") or []
+            self.extra[uri] = {"artists": [a["name"] for a in d.get("artists", [])],
+                               "album": (d.get("album") or {}).get("name", ""),
+                               "art": imgs[0]["url"] if imgs else ""}
+            self.changed(["Metadata"])
+        self.http.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, None, done, None)
+
+    # ---------- D-Bus ----------
+    def method(self, conn, sender, path, iface, name, params, inv):
+        pos_ms = self.position_us() // 1000
+        if name == "PlayPause":
+            self.send("pause" if self.state["status"] in ("playing", "buffering") else "play")
+        elif name in ("Pause", "Stop"):
+            self.send("pause")
+        elif name == "Play":
+            self.send("play")
+        elif name == "Next":
+            self.send("skip_next")
+        elif name == "Previous":
+            self.send("skip_prev")
+        elif name == "Seek":
+            self.send("seek", position_ms=max(0, int(pos_ms + params.unpack()[0] / 1000)))
+        elif name == "SetPosition":
+            tid, pos = params.unpack()
+            if tid == self.track_id():
+                self.send("seek", position_ms=max(0, int(pos / 1000)))
+        elif name == "OpenUri":
+            self.send("play", uri=params.unpack()[0])
+        inv.return_value(None)
+
+    def get_prop(self, conn, sender, path, iface, name):
+        if iface == "org.mpris.MediaPlayer2":
+            sig, val = self.ROOT[name]
+            return GLib.Variant(sig, val)
+        return self.props()[name]
+
+    def set_prop(self, conn, sender, path, iface, name, value):
+        v = value.unpack()
+        if name == "Volume":
+            self.send("set_volume", volume=max(0, min(100, round(v * 100))))
+        elif name == "Shuffle":
+            self.send("set_shuffle", enabled=bool(v))
+        elif name == "LoopStatus":       # Soloist has two flags; order as documented
+            ctx, trk = {"None": (False, False), "Playlist": (True, False), "Track": (False, True)}.get(v, (False, False))
+            first, second = (("set_repeat_track", trk), ("set_repeat_context", ctx)) if not trk else (("set_repeat_context", ctx), ("set_repeat_track", trk))
+            self.send(first[0], enabled=first[1]); self.send(second[0], enabled=second[1])
+        return True
+
+    def on_bus(self, conn, name):
+        self.conn = conn
+        for iface in self.node.interfaces:
+            conn.register_object(PATH, iface, self.method, self.get_prop, self.set_prop)
+
+    def run(self):
+        Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE, self.on_bus, None, None)
+        self.connect_ws()
+        GLib.MainLoop().run()
+
+
+def selfcheck():
+    b = Bridge()
+    b.state.update({"status": "paused", "volume": 40, "options": {"shuffle": True, "repeat": "context"},
+                    "item": {"uri": "spotify:track:abc123", "decorations": {"identity": {"name": "Song"},
+                             "playback": {"duration_ms": 200000}, "creators": [{"entity": {"decorations": {"identity": {"name": "Ann"}}}}]}},
+                    "position": {"position_ms": 5000, "timestamp_ms": 0, "speed": 0.0}})
+    p = b.props()
+    assert p["PlaybackStatus"].unpack() == "Paused" and p["LoopStatus"].unpack() == "Playlist" and p["Shuffle"].unpack()
+    md = p["Metadata"].unpack()
+    assert md["xesam:title"] == "Song" and md["xesam:artist"] == ["Ann"] and md["mpris:length"] == 200_000_000, md
+    assert p["Position"].unpack() == 5_000_000 and abs(p["Volume"].unpack() - 0.4) < 1e-9
+    assert b.track_id() == "/org/mpris/MediaPlayer2/aria/track/abc123"
+    print("aria-mpris self-check ok")
+
+
+if __name__ == "__main__":
+    selfcheck() if "--selfcheck" in sys.argv else Bridge().run()

@@ -1,0 +1,12 @@
+[Unit]
+Description=Aria audio engine (Spotify Soloist)
+Wants=pipewire-pulse.service network-online.target
+After=pipewire-pulse.service network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/aria-engine
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
