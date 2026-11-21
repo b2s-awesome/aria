@@ -26,7 +26,7 @@ Spotify Premium is required.
 - Aria fetches lyrics from [LRCLIB](https://lrclib.net), which is free and needs no account.
 - Line-synced lyrics fill as whole lines. That's what Spicy Lyrics does when it has no word timing.
 - Enhanced LRC (with `<mm:ss.xx>` word tags) switches on the word-by-word mode.
-- Support for the [Spicy Lyrics developer API](https://developers.spicylyrics.org) is planned, for syllable-synced lyrics.
+- With a [Spicy Lyrics developer API](https://developers.spicylyrics.org) key in `~/.config/aria/spicy.key`, Aria uses Spicy's syllable-synced lyrics first, then falls back to LRCLIB.
 
 Keys in the lyrics view:
 - `Esc`: leave fullscreen, or close the view
