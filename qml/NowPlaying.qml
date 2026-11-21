@@ -114,8 +114,9 @@ Item {
                 id: body
                 visible: !row.interlude
                 width: parent.width
-                implicitHeight: np.lyrics.type === "Syllable" ? flow.implicitHeight : lineFill.implicitHeight
-                transformOrigin: Item.Left
+                implicitHeight: np.lyrics.type === "Syllable" ? syllables.implicitHeight : lineFill.implicitHeight
+                readonly property bool opposite: !row.interlude && row.modelData.opposite === true   // duet: other singer, right side
+                transformOrigin: opposite ? Item.Right : Item.Left
                 scale: row.now ? 1.05 : 1
                 opacity: row.phase === 1 ? 1 : row.phase === 2 ? 0.497 : 0.51
                 Behavior on scale { NumberAnimation { duration: 500; easing.type: Easing.OutCubic } }
@@ -125,19 +126,40 @@ Item {
                 layer.enabled: !row.now && !np.userScroll
                 layer.effect: MultiEffect { blurEnabled: true; blurMax: 8; blur: Math.min(1.25 * row.dist, 6.83125) / 8 }
 
-                // Syllable: words
-                Flow {
-                    id: flow
+                // Syllable: words (each a run of syllables), then background vocals underneath
+                Column {
+                    id: syllables
                     visible: np.lyrics.type === "Syllable"
                     width: parent.width / 1.05                    // room for the active 1.05 scale
-                    spacing: np.fontPx * 0.26
+                    x: body.opposite ? parent.width - width : 0
+                    spacing: np.fontPx * 0.1
                     Repeater {
-                        model: row.interlude || np.lyrics.type !== "Syllable" ? [] : row.modelData.words
-                        LyricWord {
+                        model: [ { list: "words", size: 1, weight: Font.ExtraBold },
+                                 { list: "bg", size: 0.62, weight: Font.Bold } ]
+                        Flow {
+                            id: flow
                             required property var modelData
-                            text: modelData.text; t: modelData.t; end: modelData.end
-                            clock: np.clock; lineActive: row.now
-                            font: np.lyricFont; color: np.colors.text
+                            readonly property var wordList: row.interlude || np.lyrics.type !== "Syllable" ? [] : (row.modelData[modelData.list] || [])
+                            visible: wordList.length > 0
+                            width: syllables.width
+                            x: body.opposite ? syllables.width - childrenRect.width : 0     // duet: flush right, words in order
+                            spacing: np.fontPx * modelData.size * 0.26
+                            Repeater {
+                                model: flow.wordList
+                                Row {                             // one word = its syllables, no gaps
+                                    required property var modelData
+                                    Repeater {
+                                        model: parent.modelData.syl
+                                        LyricWord {
+                                            required property var modelData
+                                            text: modelData.text; t: modelData.t; end: modelData.end
+                                            clock: np.clock; lineActive: row.now
+                                            font: Qt.font({ family: "Inter Display", pixelSize: np.fontPx * flow.modelData.size, weight: flow.modelData.weight })
+                                            color: np.colors.text
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
