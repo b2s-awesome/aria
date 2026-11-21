@@ -32,18 +32,32 @@ ShellRoot {
     property var searchAlbums: []
     property var searchPlaylists: []
     property string meId: ""
+    // Spotify (2026 dev-mode rules) won't list songs in playlists you don't own: we can still play them,
+    // and show "Up next" from the player queue while one is playing.
+    property bool locked: false
+    readonly property bool lockedPlaying: locked && player.state && player.state.context && player.state.context.uri === contextUri
+    onLockedPlayingChanged: refreshUpNext()
+    Connections { target: player; function onItemChanged() { root.refreshUpNext() } }
+    function refreshUpNext() {
+        if (!lockedPlaying) return;
+        api.get("/me/player/queue", d => {
+            if (!root.lockedPlaying || !d) return;
+            tracks = [d.currently_playing].concat(d.queue || []).filter(t => t && t.type === "track");
+        });
+    }
 
     IpcHandler {
         target: "aria"
         function toggle(): void { root.shown = !root.shown }
         function show(): void   { root.shown = true }
         function hide(): void   { root.shown = false }
+        function search(q: string): void { root.shown = true; root.nowPlaying = false; searchBox.text = q; root.search(q) }
         function lyrics(): void { root.shown = true; root.nowPlaying = !root.nowPlaying; root.fullscreen = root.nowPlaying }
     }
 
     // ---- data loading -------------------------------------------------------------------
     function open(v, arg) {
-        view = v; tracks = []; contextUri = ""; headerArt = ""; subheading = "";
+        view = v; tracks = []; contextUri = ""; headerArt = ""; subheading = ""; locked = false;
         if (v === "home") {
             heading = "Recently played";
             api.get("/me/player/recently-played?limit=50", d => {
@@ -58,14 +72,21 @@ ShellRoot {
             heading = "Albums";
             api.get("/me/albums?limit=50", d => albums = (d && d.items || []).map(i => i.album));
         } else if (v === "playlist") {
-            heading = arg.name; subheading = "Playlist · " + (arg.owner ? arg.owner.display_name : "");
+            const total = (arg.items || arg.tracks || {}).total;
+            heading = arg.name;
+            subheading = "Playlist · " + (arg.owner ? arg.owner.display_name : "") + (total ? " · " + total + " songs" : "");
             headerArt = arg.images && arg.images.length ? arg.images[0].url : "";
             contextUri = arg.uri;
-            const load = (path, fallback) => api.get(path, (d, s) => {
-                if (s >= 400 && fallback) return load(fallback, null);
-                tracks = (d && d.items || []).map(i => i.track || i.item).filter(t => t && t.type === "track");
+            const uri = arg.uri;
+            let acc = [];
+            const page = path => api.get(path, (d, s) => {          // follow `next` until the whole playlist is in
+                if (contextUri !== uri) return;                     // navigated away meanwhile
+                if (s === 403) { locked = true; refreshUpNext(); return; }
+                acc = acc.concat((d && d.items || []).map(i => i.item || i.track).filter(t => t && t.type === "track"));
+                tracks = acc;
+                if (d && d.next) page(d.next.replace("https://api.spotify.com/v1", ""));
             });
-            load("/playlists/" + arg.id + "/tracks?limit=100", "/playlists/" + arg.id + "/items?limit=100");
+            page("/playlists/" + arg.id + "/items?limit=50");
         } else if (v === "album") {
             api.get("/albums/" + arg.id, d => {
                 if (!d) return;
@@ -82,7 +103,7 @@ ShellRoot {
     function search(q) {
         if (q.trim() === "") return;
         view = "search"; heading = "Results for “" + q + "”"; contextUri = "";
-        api.get("/search?type=track,album,playlist&limit=20&q=" + encodeURIComponent(q), d => {
+        api.get("/search?type=track,album,playlist&limit=10&q=" + encodeURIComponent(q), d => {
             tracks = d && d.tracks ? d.tracks.items.filter(t => t) : [];
             searchAlbums = d && d.albums ? d.albums.items.filter(a => a) : [];
             searchPlaylists = d && d.playlists ? d.playlists.items.filter(p => p) : [];
@@ -246,11 +267,11 @@ ShellRoot {
                     Column {
                         id: headerCol
                         anchors.bottom: parent.bottom; spacing: 6
-                        Text { text: root.subheading; visible: text !== ""; color: c.textDim; font { family: "Inter"; pixelSize: 13 } }
+                        Text { text: root.subheading + (root.lockedPlaying ? " · showing up next" : ""); visible: text !== ""; color: c.textDim; font { family: "Inter"; pixelSize: 13 } }
                         Text { text: root.heading; color: c.text; font { family: "Inter Display"; pixelSize: root.headerArt ? 38 : 30; weight: Font.Bold }
                                width: main.width - 190; elide: Text.ElideRight }
                         PlayButton {
-                            visible: root.tracks.length > 0 && root.view !== "search"
+                            visible: (root.tracks.length > 0 || root.locked) && root.view !== "search"
                             colors: c; size: 52
                             playing: player.playing && root.contextUri !== "" && player.state && player.state.context && player.state.context.uri === root.contextUri
                             onClicked: playing ? player.toggle() : root.playAll()
@@ -265,7 +286,7 @@ ShellRoot {
                     anchors { left: parent.left; right: parent.right; top: header.bottom; topMargin: 14 }
                     height: visible ? 196 : 0
                     orientation: ListView.Horizontal; spacing: 14; clip: true
-                    model: root.searchAlbums.concat(root.searchPlaylists)
+                    model: root.searchPlaylists.concat(root.searchAlbums)          // playlists first
                     delegate: Card { colors: c; onOpened: root.open(modelData.type === "album" ? "album" : "playlist", modelData) }
                 }
 
@@ -292,7 +313,9 @@ ShellRoot {
                     Text {
                         anchors.centerIn: parent
                         visible: root.tracks.length === 0 && root.view !== "search"
-                        text: api.lastError !== "" ? api.lastError : "Loading…"
+                        width: parent.width * 0.7; wrapMode: Text.WordWrap; horizontalAlignment: Text.AlignHCenter
+                        text: root.locked ? "Spotify only lets Aria list songs in playlists you own or collaborate on.\nPress play — what's coming up shows here while it plays."
+                            : api.lastError !== "" ? api.lastError : "Loading…"
                         color: c.textDim; font { family: "Inter"; pixelSize: 14 }
                     }
                 }
